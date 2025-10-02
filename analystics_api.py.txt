@@ -1,0 +1,430 @@
+from fastapi import FastAPI, HTTPException, Body, Depends, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordRequestForm
+import pymysql
+from pymysql.cursors import DictCursor
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any
+from pydantic import BaseModel
+import json
+import os
+from auth_system import (
+    create_user, authenticate_user, create_access_token,
+    get_current_user, UserCreate, Token, User, get_user_by_email
+)
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "https://resetmfg.com",
+        "http://resetmfg.com",
+        "*"  # Allow all origins for now, restrict in production
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Use environment variables for production
+DB_CONFIG = {
+    'host': os.getenv('DB_HOST', 'localhost'),
+    'database': os.getenv('DB_NAME', 'resetmfg_resetmfg_analytics'),
+    'user': os.getenv('DB_USER', 'resetmfg_analytics'),
+    'password': os.getenv('DB_PASSWORD', 'pornaccount1989'),
+    'charset': 'utf8mb4',
+    'cursorclass': DictCursor
+}
+
+
+class SessionStart(BaseModel):
+    patient_id: int
+    treatment_id: int
+    device_serial: Optional[str] = "EM272B-001"
+
+
+class SessionOutcome(BaseModel):
+    session_id: int
+    pain_before: int
+    pain_after: int
+    symptom_improvement: int
+    patient_feedback: Optional[str]
+
+
+# Root endpoint
+@app.get("/")
+def root():
+    """Root endpoint"""
+    return {"message": "EM272B Analytics API", "status": "running", "version": "1.0.0"}
+
+
+# Health check endpoint
+@app.get("/api/health")
+def health_check():
+    """Health check endpoint"""
+    try:
+        # Test database connection
+        conn = pymysql.connect(**DB_CONFIG)
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.close()
+        conn.close()
+        return {"status": "healthy", "database": "connected", "timestamp": datetime.now()}
+    except Exception as e:
+        return {"status": "unhealthy", "error": str(e), "timestamp": datetime.now()}
+
+
+# Authentication endpoints
+@app.post("/api/register", response_model=User)
+async def register(user: UserCreate):
+    """Register a new user"""
+    existing = get_user_by_email(user.email)
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    return create_user(user)
+
+
+@app.post("/api/token", response_model=Token)
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    """Login and get access token"""
+    user = authenticate_user(form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token = create_access_token(data={"sub": user["email"]})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
+@app.get("/api/me", response_model=User)
+async def read_users_me(current_user: Dict = Depends(get_current_user)):
+    """Get current user info"""
+    return current_user
+
+
+# Protected endpoints (require authentication)
+@app.get("/api/analytics/dashboard")
+def get_dashboard_stats(current_user: Dict = Depends(get_current_user)):
+    """Get overview statistics for dashboard - Protected"""
+    conn = pymysql.connect(**DB_CONFIG)
+    cur = conn.cursor()
+
+    stats = {}
+
+    # Get user-specific treatments count
+    cur.execute("""
+        SELECT COUNT(*) as total 
+        FROM user_treatments 
+        WHERE user_id = %s
+    """, (current_user['id'],))
+    stats['total_treatments'] = cur.fetchone()['total']
+
+    # Get user-specific patients count
+    cur.execute("""
+        SELECT COUNT(*) as total 
+        FROM patients 
+        WHERE doctor_id = %s
+    """, (current_user['id'],))
+    stats['total_patients'] = cur.fetchone()['total']
+
+    cur.execute("""
+        SELECT COUNT(*) as total 
+        FROM treatment_sessions 
+        WHERE started_by = %s AND started_at >= CURDATE() - INTERVAL 7 DAY
+    """, (current_user['id'],))
+    stats['sessions_this_week'] = cur.fetchone()['total']
+
+    cur.execute("""
+        SELECT AVG(so.pain_before - so.pain_after) as avg_reduction
+        FROM session_outcomes so
+        JOIN treatment_sessions ts ON so.session_id = ts.id
+        WHERE ts.started_by = %s AND so.pain_before IS NOT NULL AND so.pain_after IS NOT NULL
+    """, (current_user['id'],))
+    result = cur.fetchone()
+    stats['avg_pain_reduction'] = round(result['avg_reduction'], 1) if result['avg_reduction'] else 0
+
+    cur.execute("""
+        SELECT ut.name, COUNT(ts.id) as usage_count
+        FROM user_treatments ut
+        LEFT JOIN treatment_sessions ts ON ut.id = ts.treatment_id
+        WHERE ut.user_id = %s
+        GROUP BY ut.id, ut.name
+        ORDER BY usage_count DESC
+        LIMIT 5
+    """, (current_user['id'],))
+    stats['top_treatments'] = cur.fetchall()
+
+    stats['current_user'] = current_user['name']
+
+    cur.close()
+    conn.close()
+
+    return stats
+
+
+@app.get("/api/patients")
+def get_patients(current_user: Dict = Depends(get_current_user)):
+    """Get all patients for the current user"""
+    conn = pymysql.connect(**DB_CONFIG)
+    cur = conn.cursor()
+
+    # Only show patients for the logged-in doctor
+    cur.execute("""
+        SELECT * FROM patients 
+        WHERE doctor_id = %s 
+        ORDER BY name
+    """, (current_user['id'],))
+    patients = cur.fetchall()
+
+    cur.close()
+    conn.close()
+    return patients
+
+
+@app.post("/api/patients")
+def create_patient(patient: Dict[str, Any] = Body(...), current_user: Dict = Depends(get_current_user)):
+    """Create new patient for current user"""
+    conn = pymysql.connect(**DB_CONFIG)
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO patients (name, email, phone, notes, doctor_id)
+        VALUES (%s, %s, %s, %s, %s)
+    """, (patient.get('name'), patient.get('email'),
+          patient.get('phone'), patient.get('notes'), current_user['id']))
+
+    patient_id = cur.lastrowid
+    conn.commit()
+    
+    cur.execute("SELECT * FROM patients WHERE id = %s", (patient_id,))
+    new_patient = cur.fetchone()
+    
+    cur.close()
+    conn.close()
+
+    return new_patient
+
+
+# User Treatment Management Endpoints
+@app.post("/api/user-treatments")
+def save_user_treatment(treatment: Dict[str, Any] = Body(...), current_user: Dict = Depends(get_current_user)):
+    """Save a user's custom treatment"""
+    conn = pymysql.connect(**DB_CONFIG)
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO user_treatments (user_id, name, based_on, frequency_data, is_public)
+        VALUES (%s, %s, %s, %s, %s)
+    """, (current_user['id'], treatment['name'], treatment.get('based_on'),
+          json.dumps(treatment['frequency_data']), treatment.get('is_public', False)))
+
+    treatment_id = cur.lastrowid
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return {"id": treatment_id, "message": "Treatment saved successfully"}
+
+
+@app.get("/api/user-treatments")
+def get_user_treatments(current_user: Dict = Depends(get_current_user)):
+    """Get user's saved treatments"""
+    conn = pymysql.connect(**DB_CONFIG)
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT id, name, based_on, is_public, times_used, avg_rating, created_at
+        FROM user_treatments
+        WHERE user_id = %s
+        ORDER BY created_at DESC
+    """, (current_user['id'],))
+
+    treatments = cur.fetchall()
+    
+    # Parse frequency_data JSON for each treatment
+    for treatment in treatments:
+        if treatment.get('created_at'):
+            treatment['created_at'] = treatment['created_at'].isoformat() if hasattr(treatment['created_at'], 'isoformat') else str(treatment['created_at'])
+    
+    cur.close()
+    conn.close()
+
+    return treatments
+
+
+@app.get("/api/user-treatments/{treatment_id}")
+def get_user_treatment_detail(treatment_id: int, current_user: Dict = Depends(get_current_user)):
+    """Get detailed user treatment with frequency data"""
+    conn = pymysql.connect(**DB_CONFIG)
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT * FROM user_treatments
+        WHERE id = %s AND user_id = %s
+    """, (treatment_id, current_user['id']))
+
+    treatment = cur.fetchone()
+    if not treatment:
+        raise HTTPException(status_code=404, detail="Treatment not found")
+
+    # Parse the JSON frequency_data
+    if treatment.get('frequency_data'):
+        treatment['frequency_data'] = json.loads(treatment['frequency_data'])
+
+    cur.close()
+    conn.close()
+
+    return treatment
+
+
+@app.put("/api/user-treatments/{treatment_id}/share")
+def share_treatment(treatment_id: int, current_user: Dict = Depends(get_current_user)):
+    """Toggle public sharing of a treatment"""
+    conn = pymysql.connect(**DB_CONFIG)
+    cur = conn.cursor()
+
+    # First check ownership
+    cur.execute("SELECT is_public FROM user_treatments WHERE id = %s AND user_id = %s",
+                (treatment_id, current_user['id']))
+    result = cur.fetchone()
+
+    if not result:
+        raise HTTPException(status_code=404, detail="Treatment not found")
+
+    new_status = not result['is_public']
+
+    cur.execute("""
+        UPDATE user_treatments 
+        SET is_public = %s, updated_at = CURRENT_TIMESTAMP
+        WHERE id = %s AND user_id = %s
+    """, (new_status, treatment_id, current_user['id']))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return {"is_public": new_status, "message": f"Treatment {'shared' if new_status else 'unshared'} successfully"}
+
+
+@app.get("/api/community-treatments")
+def get_community_treatments():
+    """Get public treatments shared by users"""
+    conn = pymysql.connect(**DB_CONFIG)
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT ut.*, u.name as author_name, u.practice_name
+        FROM user_treatments ut
+        JOIN users u ON ut.user_id = u.id
+        WHERE ut.is_public = true
+        ORDER BY ut.avg_rating DESC, ut.times_used DESC
+        LIMIT 100
+    """)
+
+    treatments = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    return treatments
+
+
+@app.post("/api/community-treatments/{treatment_id}/rate")
+def rate_community_treatment(treatment_id: int, rating: Dict[str, Any] = Body(...),
+                             current_user: Dict = Depends(get_current_user)):
+    """Rate a community treatment"""
+    conn = pymysql.connect(**DB_CONFIG)
+    cur = conn.cursor()
+
+    # Update average rating (simplified - in production you'd track individual ratings)
+    cur.execute("""
+        UPDATE user_treatments 
+        SET avg_rating = (
+            CASE 
+                WHEN avg_rating IS NULL THEN %s
+                ELSE (avg_rating + %s) / 2
+            END
+        ),
+        times_used = times_used + 1
+        WHERE id = %s AND is_public = true
+    """, (rating['value'], rating['value'], treatment_id))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return {"status": "Rating recorded"}
+
+
+@app.post("/api/analytics/session/start")
+def start_treatment_session(session: SessionStart, current_user: Dict = Depends(get_current_user)):
+    """Record the start of a treatment session - Protected"""
+    conn = pymysql.connect(**DB_CONFIG)
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO treatment_sessions 
+        (patient_id, treatment_id, device_serial, started_at, started_by)
+        VALUES (%s, %s, %s, %s, %s)
+    """, (session.patient_id, session.treatment_id,
+          session.device_serial, datetime.now(), current_user['id']))
+
+    session_id = cur.lastrowid
+    conn.commit()
+
+    cur.close()
+    conn.close()
+
+    return {"session_id": session_id, "status": "started"}
+
+
+@app.post("/api/analytics/session/outcome")
+def record_session_outcome(outcome: SessionOutcome, current_user: Dict = Depends(get_current_user)):
+    """Record treatment outcome - Protected"""
+    conn = pymysql.connect(**DB_CONFIG)
+    cur = conn.cursor()
+
+    cur.execute("""
+        UPDATE treatment_sessions 
+        SET completed_at = %s,
+            duration_minutes = TIMESTAMPDIFF(MINUTE, started_at, %s)
+        WHERE id = %s
+    """, (datetime.now(), datetime.now(), outcome.session_id))
+
+    cur.execute("""
+        INSERT INTO session_outcomes
+        (session_id, pain_before, pain_after, symptom_improvement, patient_feedback)
+        VALUES (%s, %s, %s, %s, %s)
+    """, (outcome.session_id, outcome.pain_before, outcome.pain_after,
+          outcome.symptom_improvement, outcome.patient_feedback))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return {"status": "outcome recorded"}
+
+
+@app.delete("/api/user-treatments/{treatment_id}")
+def delete_user_treatment(treatment_id: int, current_user: Dict = Depends(get_current_user)):
+    """Delete a user's treatment"""
+    conn = pymysql.connect(**DB_CONFIG)
+    cur = conn.cursor()
+
+    # Check ownership before deleting
+    cur.execute("""
+        DELETE FROM user_treatments 
+        WHERE id = %s AND user_id = %s
+    """, (treatment_id, current_user['id']))
+
+    if cur.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Treatment not found or not authorized")
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return {"message": "Treatment deleted successfully"}

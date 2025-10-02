@@ -1,0 +1,125 @@
+from datetime import datetime, timedelta
+from typing import Optional, Dict
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from pydantic import BaseModel, EmailStr
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+import pymysql
+from pymysql.cursors import DictCursor
+import os
+
+# Secret key for JWT tokens - Use environment variable in production
+SECRET_KEY = os.getenv('JWT_SECRET_KEY', 'your-secret-key-here-change-in-production')
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+# Password hashing
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# OAuth2 scheme pointing to the token endpoint
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/token")
+
+# Database configuration with environment variables
+DB_CONFIG = {
+    'host': os.getenv('DB_HOST', 'localhost'),
+    'database': os.getenv('DB_NAME', 'resetmfg_resetmfg_analytics'),
+    'user': os.getenv('DB_USER', 'resetmfg_analytics'),
+    'password': os.getenv('DB_PASSWORD', 'pornaccount1989'),
+    'charset': 'utf8mb4',
+    'cursorclass': DictCursor
+}
+
+# Pydantic models
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str
+    name: str
+    practice_name: Optional[str] = None
+
+class User(BaseModel):
+    id: int
+    email: str
+    name: str
+    practice_name: Optional[str] = None
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class TokenData(BaseModel):
+    email: Optional[str] = None
+
+# Helper functions
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def get_user_by_email(email: str):
+    conn = pymysql.connect(**DB_CONFIG)
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE email = %s", (email,))
+    user = cur.fetchone()
+    cur.close()
+    conn.close()
+    return user
+
+def create_user(user: UserCreate):
+    conn = pymysql.connect(**DB_CONFIG)
+    cur = conn.cursor()
+    
+    hashed_password = get_password_hash(user.password)
+    
+    cur.execute("""
+        INSERT INTO users (email, password_hash, name, practice_name)
+        VALUES (%s, %s, %s, %s)
+    """, (user.email, hashed_password, user.name, user.practice_name))
+    
+    user_id = cur.lastrowid
+    conn.commit()
+    
+    cur.execute("SELECT id, email, name, practice_name FROM users WHERE id = %s", (user_id,))
+    new_user = cur.fetchone()
+    
+    cur.close()
+    conn.close()
+    
+    return new_user
+
+def authenticate_user(email: str, password: str):
+    user = get_user_by_email(email)
+    if not user:
+        return False
+    if not verify_password(password, user['password_hash']):
+        return False
+    return user
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            raise credentials_exception
+        token_data = TokenData(email=email)
+    except JWTError:
+        raise credentials_exception
+    
+    user = get_user_by_email(email=token_data.email)
+    if user is None:
+        raise credentials_exception
+    return user
